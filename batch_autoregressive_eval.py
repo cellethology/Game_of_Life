@@ -24,6 +24,7 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 import pandas as pd
+import itertools
 
 from models import MLP
 from game_of_life import random_board, step as gol_step
@@ -77,23 +78,32 @@ def extract_patches_wrap(board: np.ndarray, patch_size: int) -> torch.Tensor:
 
 
 def predict_board(model: torch.nn.Module, board: np.ndarray, patch_size: int, device: torch.device,
-                  threshold: float) -> np.ndarray:
+                  threshold: float, temperature: float = 1.0) -> np.ndarray:
     patches = extract_patches_wrap(board, patch_size).to(device)
     with torch.no_grad():
         logits = model(patches)
+        if temperature != 1.0:
+            logits = logits / temperature
         probs = torch.sigmoid(logits)
         pred = (probs > threshold).float().cpu().numpy().astype(np.uint8)
     return pred.reshape(board.shape)
 
 
 def run_rollout(model: torch.nn.Module, t0: np.ndarray, patch_size: int, device: torch.device,
-                steps: int, threshold: float) -> List[np.ndarray]:
+                steps: int, threshold: float, temperature: float = 1.0,
+                adaptive: bool = False, target_density: float | None = None,
+                adaptive_gain: float = 0.0, thr_min: float = 0.1, thr_max: float = 0.9) -> List[np.ndarray]:
     cur = t0.copy()
     traj = []
+    thr = threshold
+    tgt = target_density if target_density is not None else density(t0)
     for _ in range(steps):
-        nxt = predict_board(model, cur, patch_size, device, threshold)
+        nxt = predict_board(model, cur, patch_size, device, thr, temperature)
         traj.append(nxt)
         cur = nxt
+        if adaptive:
+            dens = density(nxt)
+            thr = np.clip(thr + adaptive_gain * (dens - tgt), thr_min, thr_max)
     return traj
 
 
@@ -237,8 +247,12 @@ def find_checkpoint(patch_size: int, regime: str, density: float, variant: str) 
 
 
 def run_one(config: Dict, device: torch.device, viz_dir: Path,
-            threshold: float, steps: int, snap_steps: List[int],
-            alignment: str, model_variant: str) -> Dict:
+            thresholds: List[float], temperatures: List[float],
+            steps: int, snap_steps: List[int], alignment: str,
+            model_variant: str, tune_short_steps: int = 0,
+            adaptive: bool = False, adaptive_gain: float = 0.0,
+            thr_min: float = 0.1, thr_max: float = 0.9,
+            target_density: float | None = None) -> Dict:
     patch_size = config["patch_size"]
     regime = config["regime"]
     density_init = config["density"]
@@ -261,7 +275,57 @@ def run_one(config: Dict, device: torch.device, viz_dir: Path,
     t0 = board.copy()
 
     true_traj = run_gol(t0, steps)
-    pred_traj = run_rollout(model, t0, patch_size, device, steps, threshold)
+    # Hyperparameter selection (temperature/threshold)
+    best_temp = temperatures[0]
+    best_thr = thresholds[0]
+
+    if tune_short_steps and len(thresholds) * len(temperatures) > 1:
+        best_score = -1.0
+        best_density_dev = float("inf")
+        for temp, thr in itertools.product(temperatures, thresholds):
+            short_true = true_traj[:tune_short_steps]
+            short_pred = run_rollout(
+                model,
+                t0,
+                patch_size,
+                device,
+                tune_short_steps,
+                thr,
+                temp,
+                adaptive=adaptive,
+                target_density=target_density,
+                adaptive_gain=adaptive_gain,
+                thr_min=thr_min,
+                thr_max=thr_max,
+            )
+            # targets per alignment
+            if alignment == "next":
+                targets = short_true
+            else:
+                targets = [t0] + short_true[: max(len(short_pred) - 1, 0)]
+            f1s_short = f1_curve(short_pred, targets)
+            score = float(np.mean(f1s_short)) if f1s_short else 0.0
+            # density deviation at end of short rollout vs initial
+            dens_dev = abs(density(short_pred[-1]) - density(t0)) if short_pred else float("inf")
+            if score > best_score or (abs(score - best_score) < 1e-6 and dens_dev < best_density_dev):
+                best_score = score
+                best_density_dev = dens_dev
+                best_temp, best_thr = temp, thr
+
+    pred_traj = run_rollout(
+        model,
+        t0,
+        patch_size,
+        device,
+        steps,
+        best_thr,
+        best_temp,
+        adaptive=adaptive,
+        target_density=target_density,
+        adaptive_gain=adaptive_gain,
+        thr_min=thr_min,
+        thr_max=thr_max,
+    )
 
     d_true_full = [density(b) for b in true_traj]
     d_pred = [density(b) for b in pred_traj]
@@ -277,7 +341,7 @@ def run_one(config: Dict, device: torch.device, viz_dir: Path,
     zero_step, one_step = first_collapse(pred_traj)
     acc_self_first = float((pred_traj[0] == t0).mean()) if pred_traj else None  # self-consistency vs t0
 
-    name = f"patch{patch_size}_{regime}_p{density_init:.1f}_s{seed}"
+    name = f"patch{patch_size}_{regime}_p{density_init:.1f}_s{seed}_v{model_variant}_temp{best_temp:.2f}_thr{best_thr:.2f}"
     plot_curves(d_true_plot, d_pred, acc, f1s, viz_dir, name, alignment)
     plot_snapshots(t0, true_traj, pred_traj, snap_steps, viz_dir, name, alignment)
 
@@ -286,7 +350,7 @@ def run_one(config: Dict, device: torch.device, viz_dir: Path,
         "regime": regime,
         "density": density_init,
         "seed": seed,
-        "threshold": threshold,
+        "threshold": best_thr,
         "steps": steps,
         "burn_in": burn_in,
         "board_size": board_size,
@@ -302,6 +366,13 @@ def run_one(config: Dict, device: torch.device, viz_dir: Path,
         "first_one_step": one_step,
         "checkpoint": str(ckpt),
         "model_variant": model_variant,
+        "temperature": best_temp,
+        "threshold": best_thr,
+        "adaptive": adaptive,
+        "adaptive_gain": adaptive_gain,
+        "thr_min": thr_min,
+        "thr_max": thr_max,
+        "target_density": target_density if target_density is not None else density(t0),
     }
 
 
@@ -314,16 +385,29 @@ def main():
     parser.add_argument("--seeds", type=int, nargs="*", default=[0, 1])
     parser.add_argument("--board_size", type=int, default=128)
     parser.add_argument("--steps", type=int, default=50)
-    parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--thresholds", type=float, nargs="+", default=[0.5],
+                        help="Decision thresholds to try; if multiple and tune_short_steps>0, will tune.")
+    parser.add_argument("--temperatures", type=float, nargs="+", default=[1.0],
+                        help="Logit temperatures to try; if multiple and tune_short_steps>0, will tune.")
+    parser.add_argument("--adaptive", action="store_true",
+                        help="Enable adaptive thresholding per step based on density.")
+    parser.add_argument("--adaptive_gain", type=float, default=0.0,
+                        help="Gain for adaptive thresholding (thr += gain*(density-target)).")
+    parser.add_argument("--thr_min", type=float, default=0.1, help="Min threshold for adaptive mode.")
+    parser.add_argument("--thr_max", type=float, default=0.9, help="Max threshold for adaptive mode.")
+    parser.add_argument("--target_density", type=float, default=None,
+                        help="Target density for adaptive thresholding; default uses initial t0 density.")
     parser.add_argument("--viz_dir", type=Path, default=Path("rollout_batch_viz"))
-    parser.add_argument("--snap_steps", type=int, nargs="*", default=[0, 1, 5, 10, 20, 40, 50, 80,160],
+    parser.add_argument("--snap_steps", type=int, nargs="*", default=[0, 1, 5, 10, 20, 40, 50, 80, 160],
                         help="Steps to visualize; include 0 to show t0 when alignment=current.")
     parser.add_argument("--out_csv", type=Path, default=None,
-                        help="Output CSV path; default adds alignment suffix.")
+                        help="(disabled) Output CSV path; metrics are not saved in this run.")
     parser.add_argument("--alignment", choices=["next", "current"], default="next",
                         help="Alignment: 'next' compares to true t+1...; 'current' compares first pred to t0 and starts at step 0.")
     parser.add_argument("--model_variant", choices=["general", "match"], default="general",
                         help="Use general models (p=0.5) or regime/density-matched checkpoints if available.")
+    parser.add_argument("--tune_short_steps", type=int, default=0,
+                        help="If >0 and multiple temps/thresholds are provided, tune on a short rollout of this length.")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -345,22 +429,33 @@ def main():
 
     results = []
     viz_dir = args.viz_dir / args.alignment
-    out_csv = args.out_csv or Path(f"rollout_batch_metrics_{args.alignment}_{args.model_variant}.csv")
     for cfg in configs:
         name = f"{cfg['patch_size']}|{cfg['regime']}|{cfg['density']}|{cfg['seed']}"
         try:
             print(f"Running {name} ...")
-            res = run_one(cfg, device, viz_dir, args.threshold, args.steps, args.snap_steps, args.alignment, args.model_variant)
+            res = run_one(
+                cfg,
+                device,
+                viz_dir,
+                args.thresholds,
+                args.temperatures,
+                args.steps,
+                args.snap_steps,
+                args.alignment,
+                args.model_variant,
+                args.tune_short_steps,
+                args.adaptive,
+                args.adaptive_gain,
+                args.thr_min,
+                args.thr_max,
+                args.target_density,
+            )
             results.append(res)
         except Exception as e:
             print(f"Failed {name}: {e}")
 
-    if results:
-        df = pd.DataFrame(results)
-        out_csv.parent.mkdir(parents=True, exist_ok=True)
-        df.to_csv(out_csv, index=False)
-        print(f"Saved metrics to {out_csv}")
-    print(f"Done. Total runs: {len(results)}")
+    # CSV saving disabled per request; focus on visuals
+    print(f"Done. Total runs: {len(results)} (metrics not saved to CSV)")
 
 
 if __name__ == "__main__":
