@@ -1,0 +1,2 @@
+patch_size,regime,density,seed,threshold,steps,burn_in,board_size,init_density,final_pred_density,final_true_density,acc_self_first,acc_first,acc_last,f1_first,f1_last,first_zero_step,first_one_step
+7,early,0.8,0,0.5,50,10,128,0.00213623046875,0.021728515625,0.00213623046875,0.999755859375,0.999267578125,0.98016357421875,0.8536585365853658,0.16879795396419436,,

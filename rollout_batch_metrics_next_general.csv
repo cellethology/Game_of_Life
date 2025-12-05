@@ -1,0 +1,4 @@
+patch_size,regime,density,seed,threshold,steps,burn_in,board_size,init_density,final_pred_density,final_true_density,acc_self_first,acc_first,acc_last,f1_first,f1_last,first_zero_step,first_one_step,checkpoint,model_variant
+3,early,0.7,0,0.5,50,10,128,0.0238037109375,0.81744384765625,0.02947998046875,0.976806640625,0.97137451171875,0.19921875,0.543330087633885,0.054482559815508785,,,checkpoints_weighted/best_model_patch3_life_patches_epoch17.pth,general
+5,early,0.7,0,0.5,50,10,128,0.0238037109375,0.83941650390625,0.02947998046875,0.98468017578125,0.9781494140625,0.1883544921875,0.6022222222222222,0.06588929474571509,,,checkpoints_weighted/best_model_patch5_life_patches_epoch15.pth,general
+7,early,0.7,0,0.5,50,10,128,0.0238037109375,0.116943359375,0.02947998046875,0.98712158203125,0.978515625,0.88531494140625,0.5935334872979215,0.21675698207586494,,,checkpoints_weighted/best_model_patch7_life_patches_epoch15.pth,general
