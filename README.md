@@ -1,108 +1,86 @@
-# Conway's Game of Life MLP Prediction
+## Conway Life: Local MLP Predictors, Rollouts, and Dynamics
 
-This project trains MLP models to predict the current center cell of Conway's Game of Life using local neighborhoods. It compares the performance of 3×3 versus 5×5 neighborhood sizes.
+This repo trains and evaluates MLPs that approximate Conway’s Game of Life.  
+We focus on (1) single-step patch prediction for 3×3/5×5/7×7 neighborhoods,  
+(2) autoregressive rollouts with/without calibration, and (3) a dynamics
+baseline that maps a full 3×3 patch to the next-step center cell.
 
-## Project Overview
+### What’s here (kept files)
+- `data.py` / `game_of_life.py`: dataset generation (toroidal wrap), GoL simulator.
+- `models.py`: MLPs for patch classifiers.
+- `train_weighted.py`: trains 3×3, 5×5, 7×7 patch models on the general dataset (p=0.5, wrap) with class weighting `w_pos = min(5, sqrt(r))`. Saves to `checkpoints_weighted/`.
+- `train_weighted_regimes.py`: train/evaluate per-regime/density if needed.
+- `eval_patch_models.py`: evaluate existing checkpoints on test split; can write CSV.
+- `batch_autoregressive_eval.py`: batched rollouts (default alignment `current`) with options:
+  - `--model_variant {general,match}` selects general ckpt vs regime/density-matched ckpt.
+  - `--calibrated` enables temp/threshold scan + optional adaptive thresholding.
+  - Outputs snapshots/curves/CSV to `rollout_batch_viz/<calibrated|noncalibrated>/<general|matched>/`.
+- `train_dynamics_patch3.py`: 9→1 dynamics model (full 3×3 → next center), with early stopping and board-level rollouts; checkpoints in `checkpoints_dynamics/`.
+- `rollout_batch_viz/`: current rollout figures and CSVs (calibrated & noncalibrated, general & matched).
+- `legacy_viz/`: older confusion-matrix figures.
+- `checkpoints_weighted/`, `checkpoints_dynamics/`, `data/`: trained models and datasets (kept).
 
-1. **Simulation**: Generates Conway's Game of Life trajectories on toroidal grids
-2. **Dataset**: Creates paired datasets of 3×3 and 5×5 neighborhoods with the same center cells
-3. **Training**: Trains two MLP models to predict center cell states
-4. **Comparison**: Evaluates and compares test accuracy between neighborhood sizes
-
-## File Structure
-
-```
-life_mlp/
-├── __init__.py          # Package initialization
-├── game_of_life.py      # Game of Life simulation utilities
-├── data.py             # Dataset generation and PyTorch Dataset class
-├── models.py           # MLP model definition
-├── train.py            # Single experiment training script
-├── experiments_mlp.py  # Grid experiment runner
-└── README.md           # This file
-```
-
-## Dependencies
-
-- Python 3
-- PyTorch 2.2.2+ (with CUDA support if available)
-- NumPy
-
-## Usage
-
-### From Terminal
+### Typical commands
+Train general weighted models (wrap data, patch 3/5/7):
 ```bash
-# From the folder containing life_mlp
-cd life_mlp
-python -m train
+python train_weighted.py
 ```
 
-### From Jupyter Notebook
-```python
-# In a notebook cell
-!python -m life_mlp.train
-```
-
-### Grid Experiments
-
-Run systematic experiments across different densities and time regimes:
-
+Evaluate a checkpoint on the test split:
 ```bash
-# Run all experiments (27 combinations × 3 seeds × 2 patch sizes = 162 models)
-python -m life_mlp.experiments_mlp
+python eval_patch_models.py --ckpt checkpoints_weighted/best_model_patch5_life_patches_epoch15.pth
 ```
 
-This will:
-- Generate datasets with different initial densities (0.2, 0.4, 0.6)
-- Test different time regimes (early: burn-in=10, mid: burn-in=60, late: burn-in=160)
-- Use multiple random seeds (0, 1, 2) for robustness
-- Train both 3×3 and 5×5 models for each configuration
-- Save results to `results_mlp_grid.csv`
+Run non-calibrated rollouts (general models, alignment=current):
+```bash
+python batch_autoregressive_eval.py \
+  --patch_sizes 3 5 7 \
+  --regimes early mid late \
+  --densities 0.2 0.4 0.6 \
+  --seeds 0 \
+  --steps 50 \
+  --model_variant general
+# results → rollout_batch_viz/noncalibrated/general/
+```
 
-## Dataset Configuration
+Run calibrated rollouts (temperature + threshold scan, adaptive thresholding enabled):
+```bash
+python batch_autoregressive_eval.py \
+  --patch_sizes 3 5 7 \
+  --regimes early mid late \
+  --densities 0.2 0.4 0.6 \
+  --seeds 0 \
+  --steps 50 \
+  --model_variant general \
+  --calibrated
+# results → rollout_batch_viz/calibrated/general/
+```
 
-The default settings generate a dataset that runs quickly on GPU but still provides good statistics:
+Matched models (if per-regime/density checkpoints are available) use `--model_variant match`
+and save under `rollout_batch_viz/.../matched/`.
 
-- **Board size**: 128×128
-- **Training boards**: 16 boards × 60 steps × 200 patches/step = 192,000 samples
-- **Test boards**: 4 boards × 60 steps × 200 patches/step = 48,000 samples
-- **Patch sizes**: 3×3 (8 features) and 5×5 (24 features)
-- **Data file**: `data/life_patches.npz`
+Train the dynamics 3×3→next-center model and test board rollouts:
+```bash
+python train_dynamics_patch3.py --generate --max_epochs 10 --patience 2
+```
 
-## Training Configuration
+### Data & checkpoints
+- Default dataset: `data/life_patches.npz` (wrap extraction, includes 3/5/7 patches).
+- General checkpoints: `checkpoints_weighted/best_model_patch{3,5,7}_*.pth`.
+- Dynamics checkpoint: `checkpoints_dynamics/best_model_dynamics_patch3.pth`.
 
-Default hyperparameters chosen for quick training:
+### Outputs
+- Rollouts: density curves + accuracy/F1 curves + board snapshots per run, plus CSV with
+  avg_acc/avg_f1/precision/recall and chosen temp/threshold (for calibrated runs).
+- Dynamics script: training/val logs, test metrics, and short board rollouts printed to stdout.
 
-- **Batch size**: 1024
-- **Epochs**: 10
-- **Learning rate**: 1e-3
-- **Optimizer**: Adam
-- **Loss**: Binary Cross Entropy with Logits
-- **Model**: MLP with hidden layers [128, 128]
+### Notes
+- Everything uses toroidal wrap to avoid edge artifacts.
+- Class imbalance handled via positive class weight `min(5, sqrt(r))`.
+- Calibration (when enabled) scans temps {1, 1.5, 2} and thresholds {0.6, 0.7} on a short horizon, then runs full rollout with optional adaptive threshold tied to predicted density.
 
-The script automatically uses GPU if available (CUDA), otherwise falls back to CPU.
-
-## Expected Runtime
-
-- **Single experiment (train.py)**:
-  - NVIDIA A100 GPU: ~2-5 minutes
-  - CPU: ~10-30 minutes
-
-- **Full grid experiments (experiments_mlp.py)**:
-  - NVIDIA A100 GPU: ~1-2 hours (162 models total)
-  - CPU: ~6-12 hours (slower but still feasible)
-
-## Output
-
-### Single Experiment (train.py)
-- Training progress for each epoch (loss and accuracy)
-- Final test accuracy for both 3×3 and 5×5 models
-- Performance improvement achieved by using larger neighborhoods
-
-### Grid Experiments (experiments_mlp.py)
-- Progress tracking for all 27 experiment configurations
-- Summary table comparing 3×3 vs 5×5 performance across regimes
-- CSV file (`results_mlp_grid.csv`) with detailed results for analysis
-- Individual datasets saved with descriptive filenames (e.g., `data/life_patches_early_p0.2_burn10_steps40_seed0.npz`)
-
-The datasets are cached for future runs, so subsequent experiments will be faster.
+### Progress so far
+- Early phase: evaluated patch-level predictors across densities/regimes; recall was low, so we adopted the weighted loss (V1) based on F1 trade-off.
+- Autoregressive phase: rolled out single-step models; severe “explosion to all-alive” prompted calibration (temp + threshold + optional adaptive tweak). Calibration lifts accuracy but F1 remains modest and drift persists.
+- Dynamics probe: trained a 3×3→next-center model using wrapped data; achieved perfect test and board-level rollouts (deterministic mapping is learnable).
+- Next steps: use the autoregressive setup to check whether the model reproduces stable GoL motifs (still lifes, oscillators, gliders) or collapses to trivial attractors; refine calibration/thresholding if needed.

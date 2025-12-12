@@ -338,8 +338,31 @@ def run_one(config: Dict, device: torch.device, viz_dir: Path,
         acc = [float((p == t).mean()) for p, t in zip(pred_traj, targets)]
         f1s = f1_curve(pred_traj, targets)
         d_true_plot = [density(t0)] + d_true_full[: len(d_pred) - 1]
+    avg_acc = float(np.mean(acc)) if acc else 0.0
+    avg_f1 = float(np.mean(f1s)) if f1s else 0.0
     zero_step, one_step = first_collapse(pred_traj)
     acc_self_first = float((pred_traj[0] == t0).mean()) if pred_traj else None  # self-consistency vs t0
+
+    # compute per-step precision/recall if needed for first/last
+    def prec_rec_step(pred, targ):
+        tp = np.logical_and(pred == 1, targ == 1).sum()
+        fp = np.logical_and(pred == 1, targ == 0).sum()
+        fn = np.logical_and(pred == 0, targ == 1).sum()
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        return prec, rec
+
+    prec_first = rec_first = prec_last = rec_last = None
+    if pred_traj:
+        if alignment == "next":
+            targ_first = true_traj[0]
+            targ_last = true_traj[min(len(true_traj) - 1, len(pred_traj) - 1)]
+        else:
+            targ_first = t0
+            idx_last = min(len(pred_traj) - 1, len(true_traj))  # pred idx = last, target idx shift by 1
+            targ_last = t0 if idx_last == 0 else true_traj[idx_last - 1]
+        prec_first, rec_first = prec_rec_step(pred_traj[0], targ_first)
+        prec_last, rec_last = prec_rec_step(pred_traj[-1], targ_last)
 
     name = f"patch{patch_size}_{regime}_p{density_init:.1f}_s{seed}_v{model_variant}_temp{best_temp:.2f}_thr{best_thr:.2f}"
     plot_curves(d_true_plot, d_pred, acc, f1s, viz_dir, name, alignment)
@@ -362,6 +385,12 @@ def run_one(config: Dict, device: torch.device, viz_dir: Path,
         "acc_last": acc[-1] if acc else None,
         "f1_first": f1s[0] if f1s else None,
         "f1_last": f1s[-1] if f1s else None,
+        "avg_acc": avg_acc,
+        "avg_f1": avg_f1,
+        "prec_first": prec_first,
+        "rec_first": rec_first,
+        "prec_last": prec_last,
+        "rec_last": rec_last,
         "first_zero_step": zero_step,
         "first_one_step": one_step,
         "checkpoint": str(ckpt),
@@ -398,11 +427,15 @@ def main():
     parser.add_argument("--target_density", type=float, default=None,
                         help="Target density for adaptive thresholding; default uses initial t0 density.")
     parser.add_argument("--viz_dir", type=Path, default=Path("rollout_batch_viz"))
+    parser.add_argument("--viz_group", type=str, default="",
+                        help="Optional subfolder under viz_dir (e.g., 'calibrated' or 'noncalibrated').")
+    parser.add_argument("--calibrated", action="store_true",
+                        help="If set, and viz_group not provided, outputs go to 'calibrated'; otherwise 'noncalibrated'.")
     parser.add_argument("--snap_steps", type=int, nargs="*", default=[0, 1, 5, 10, 20, 40, 50, 80, 160],
                         help="Steps to visualize; include 0 to show t0 when alignment=current.")
     parser.add_argument("--out_csv", type=Path, default=None,
-                        help="(disabled) Output CSV path; metrics are not saved in this run.")
-    parser.add_argument("--alignment", choices=["next", "current"], default="next",
+                        help="Output CSV path; if set, metrics will be saved.")
+    parser.add_argument("--alignment", choices=["next", "current"], default="current",
                         help="Alignment: 'next' compares to true t+1...; 'current' compares first pred to t0 and starts at step 0.")
     parser.add_argument("--model_variant", choices=["general", "match"], default="general",
                         help="Use general models (p=0.5) or regime/density-matched checkpoints if available.")
@@ -428,7 +461,15 @@ def main():
                     })
 
     results = []
-    viz_dir = args.viz_dir / args.alignment
+    # Map model_variant to folder names you created: general -> general, match -> matched
+    variant_folder = "general" if args.model_variant == "general" else "matched"
+    viz_base = args.viz_dir
+    # default viz_group if not provided
+    chosen_group = args.viz_group
+    if not chosen_group:
+        chosen_group = "calibrated" if args.calibrated else "noncalibrated"
+    viz_base = viz_base / chosen_group
+    viz_dir = viz_base / variant_folder
     for cfg in configs:
         name = f"{cfg['patch_size']}|{cfg['regime']}|{cfg['density']}|{cfg['seed']}"
         try:
@@ -454,8 +495,14 @@ def main():
         except Exception as e:
             print(f"Failed {name}: {e}")
 
-    # CSV saving disabled per request; focus on visuals
-    print(f"Done. Total runs: {len(results)} (metrics not saved to CSV)")
+    if results and args.out_csv:
+        import pandas as pd
+        df = pd.DataFrame(results)
+        args.out_csv.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(args.out_csv, index=False)
+        print(f"Saved metrics to {args.out_csv}")
+
+    print(f"Done. Total runs: {len(results)}")
 
 
 if __name__ == "__main__":
